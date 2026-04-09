@@ -188,7 +188,35 @@ describe('scheduler/scheduled regression', () => {
       now: expectedNow,
       compute: expect.any(Function),
     });
+    const refreshArgs = vi.mocked(refreshPublicHomepageSnapshotIfNeeded).mock.calls[0]?.[0];
+    expect(refreshArgs).toBeDefined();
+    await refreshArgs?.compute();
+    expect(computePublicHomepagePayload).toHaveBeenCalledWith(env.DB, expectedNow);
     expect(waitUntil).toHaveBeenCalledTimes(1);
+  });
+
+  it('logs homepage snapshot refresh failures without breaking the tick', async () => {
+    vi.mocked(refreshPublicHomepageSnapshotIfNeeded).mockRejectedValueOnce(
+      new Error('snapshot refresh failed'),
+    );
+
+    const env = createEnv({ dueRows: [] });
+    const waitUntil = vi.fn();
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+      expect(waitUntil).toHaveBeenCalledTimes(1);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(warnSpy).toHaveBeenCalledWith(
+        'homepage snapshot: refresh failed',
+        expect.any(Error),
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
   });
 
   it('processes due HTTP monitors and writes check/state rows', async () => {
@@ -546,6 +574,114 @@ describe('scheduler/scheduled regression', () => {
     expect(runArgs[checkInsertIndex]?.[7]).toBe(2);
   });
 
+  it('logs failed due monitor runs and still schedules homepage refresh', async () => {
+    const dueRows = [
+      {
+        id: 501,
+        name: 'Broken API',
+        type: 'http',
+        target: 'https://broken.example.com/health',
+        interval_sec: 60,
+        timeout_ms: 5000,
+        http_method: 'GET',
+        http_headers_json: null,
+        http_body: null,
+        expected_status_json: null,
+        response_keyword: null,
+        response_forbidden_keyword: null,
+        state_status: 'up',
+        last_changed_at: 1700000000,
+        consecutive_failures: 0,
+        consecutive_successes: 2,
+      },
+    ];
+    Object.defineProperty(dueRows[0] as Record<string, unknown>, 'state_last_error', {
+      get() {
+        throw new Error('corrupt state row');
+      },
+    });
+    const env = createEnv({ dueRows });
+    const waitUntil = vi.fn();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        'scheduled: 1/1 monitors failed',
+        expect.objectContaining({
+          status: 'rejected',
+          reason: expect.any(Error),
+        }),
+      );
+      expect(waitUntil).toHaveBeenCalledTimes(1);
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
+  it('logs failed monitor notification dispatches', async () => {
+    vi.mocked(runHttpCheck).mockResolvedValue({
+      status: 'down',
+      latencyMs: 123,
+      httpStatus: 503,
+      error: 'HTTP 503',
+      attempts: 2,
+    });
+    vi.mocked(dispatchWebhookToChannels).mockRejectedValueOnce(new Error('webhook unavailable'));
+
+    const dueRows = [
+      {
+        id: 502,
+        name: 'Core API',
+        type: 'http',
+        target: 'https://api.example.com/health',
+        interval_sec: 60,
+        timeout_ms: 5000,
+        http_method: 'GET',
+        http_headers_json: null,
+        http_body: null,
+        expected_status_json: null,
+        response_keyword: null,
+        response_forbidden_keyword: null,
+        state_status: 'up',
+        state_last_error: null,
+        last_changed_at: 1700000000,
+        consecutive_failures: 1,
+        consecutive_successes: 0,
+      },
+    ];
+    const channels = [
+      {
+        id: 12,
+        name: 'primary',
+        config_json: JSON.stringify({
+          url: 'https://hooks.example.com/uptimer',
+          method: 'POST',
+          payload_type: 'json',
+        }),
+        created_at: 1700000000,
+      },
+    ];
+    const env = createEnv({ dueRows, channels });
+    const waitUntil = vi.fn();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+      expect(waitUntil).toHaveBeenCalledTimes(2);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        'notify: failed to dispatch webhooks',
+        expect.any(Error),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   it('emits maintenance started/ended notifications using created_at gating', async () => {
     const now = Math.floor(Date.now() / 1000);
     const startedAt = now - 60;
@@ -623,5 +759,70 @@ describe('scheduler/scheduled regression', () => {
         channels: [expect.objectContaining({ id: 10 })],
       }),
     );
+  });
+
+  it('logs failed maintenance notification dispatches', async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const startedAt = now - 60;
+    const endedAt = now - 20;
+    const channels = [
+      {
+        id: 13,
+        name: 'older',
+        config_json: JSON.stringify({
+          url: 'https://hooks.example.com/uptimer',
+          method: 'POST',
+          payload_type: 'json',
+        }),
+        created_at: startedAt - 10,
+      },
+    ];
+    vi.mocked(dispatchWebhookToChannels).mockRejectedValue(new Error('maintenance webhook failed'));
+
+    const env = createEnv({
+      dueRows: [],
+      channels,
+      startedWindows: [
+        {
+          id: 2,
+          title: 'Deploy',
+          message: null,
+          starts_at: startedAt,
+          ends_at: endedAt,
+          created_at: startedAt - 100,
+        },
+      ],
+      endedWindows: [
+        {
+          id: 2,
+          title: 'Deploy',
+          message: null,
+          starts_at: startedAt,
+          ends_at: endedAt,
+          created_at: startedAt - 100,
+        },
+      ],
+      windowMonitorLinks: [{ maintenance_window_id: 2, monitor_id: 301 }],
+    });
+    const waitUntil = vi.fn();
+    const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    try {
+      await runScheduledTick(env, { waitUntil } as unknown as ExecutionContext);
+
+      expect(waitUntil).toHaveBeenCalledTimes(3);
+      await Promise.all(waitUntil.mock.calls.map((call) => call[0] as Promise<unknown>));
+
+      expect(errorSpy).toHaveBeenCalledWith(
+        'notify: failed to dispatch maintenance.started',
+        expect.any(Error),
+      );
+      expect(errorSpy).toHaveBeenCalledWith(
+        'notify: failed to dispatch maintenance.ended',
+        expect.any(Error),
+      );
+    } finally {
+      errorSpy.mockRestore();
+    }
   });
 });
