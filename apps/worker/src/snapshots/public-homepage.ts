@@ -23,16 +23,6 @@ export type PublicHomepageRenderArtifact = {
   meta_description: string;
 };
 
-type StoredHomepageDataSnapshot = {
-  version: typeof SPLIT_SNAPSHOT_VERSION;
-  data: PublicHomepageResponse;
-};
-
-type StoredHomepageRenderSnapshot = {
-  version: typeof SPLIT_SNAPSHOT_VERSION;
-  render: PublicHomepageRenderArtifact;
-};
-
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null;
 }
