@@ -48,8 +48,57 @@ function looksLikeSerializedStatusPayload(text: string): boolean {
     trimmed.includes('"site_title"') &&
     trimmed.includes('"overall_status"') &&
     trimmed.includes('"monitors"') &&
-    trimmed.includes('"summary"')
+    trimmed.includes('"summary"') &&
+    trimmed.includes('"maintenance_windows"')
   );
+}
+
+function looksLikeCompleteJsonObject(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length < 2) return false;
+  if (trimmed[0] !== '{' || trimmed[trimmed.length - 1] !== '}') return false;
+
+  const stack: ('{' | '[')[] = [];
+  let inString = false;
+
+  for (let index = 0; index < trimmed.length; index += 1) {
+    const ch = trimmed[index] as string;
+
+    if (inString) {
+      if (ch === '\\') {
+        index += 1;
+        continue;
+      }
+      if (ch === '"') {
+        inString = false;
+      }
+      continue;
+    }
+
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+
+    if (ch === '{' || ch === '[') {
+      stack.push(ch as '{' | '[');
+      continue;
+    }
+
+    if (ch === '}' || ch === ']') {
+      const open = stack.pop();
+      if (!open) return false;
+      if (ch === '}' && open !== '{') return false;
+      if (ch === ']' && open !== '[') return false;
+
+      // The root object must end at the end of the string.
+      if (stack.length === 0 && index !== trimmed.length - 1) {
+        return false;
+      }
+    }
+  }
+
+  return !inString && stack.length === 0;
 }
 
 export async function readStatusSnapshot(
@@ -109,13 +158,16 @@ export async function readStatusSnapshotJson(
     const age = Math.max(0, now - row.generated_at);
     if (age > MAX_AGE_SECONDS) return null;
 
-    if (looksLikeSerializedStatusPayload(row.body_json)) {
+    if (
+      looksLikeSerializedStatusPayload(row.body_json) &&
+      looksLikeCompleteJsonObject(row.body_json)
+    ) {
       return { bodyJson: row.body_json, age };
     }
 
     const parsed = safeJsonParse(row.body_json);
     if (looksLikeStatusPayload(parsed)) {
-      return { bodyJson: JSON.stringify(parsed), age };
+      return { bodyJson: row.body_json, age };
     }
 
     const data = publicStatusResponseSchema.parse(parsed);
